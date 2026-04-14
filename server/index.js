@@ -1,12 +1,23 @@
 import cors from 'cors';
 import dotenv from 'dotenv';
 import express from 'express';
+import { OAuth2Client } from 'google-auth-library';
+import jwt from 'jsonwebtoken';
 import OpenAI from 'openai';
 
 dotenv.config();
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
+const JWT_SECRET = process.env.JWT_SECRET;
+
+if (!process.env.OPENAI_API_KEY) {
+  throw new Error('Missing OPENAI_API_KEY in .env');
+}
+
+if (!JWT_SECRET) {
+  throw new Error('Missing JWT_SECRET in .env');
+}
 
 app.use(cors());
 app.use(express.json({ limit: '15mb' }));
@@ -15,11 +26,162 @@ const client = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
+const googleClient = new OAuth2Client();
+
+/**
+ * Temporary in-memory user store for testing.
+ * Later we can move this to a real database.
+ */
+const usersById = new Map();
+const usersByProviderKey = new Map();
+
+function createAppToken(user) {
+  return jwt.sign(
+    {
+      sub: user.id,
+      email: user.email,
+      provider: user.provider,
+    },
+    JWT_SECRET,
+    {
+      expiresIn: '30d',
+    }
+  );
+}
+
+function authMiddleware(req, res, next) {
+  try {
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.startsWith('Bearer ')
+      ? authHeader.slice(7)
+      : null;
+
+    if (!token) {
+      return res.status(401).json({
+        error: 'Missing auth token',
+      });
+    }
+
+    const payload = jwt.verify(token, JWT_SECRET);
+    req.user = payload;
+    next();
+  } catch (error) {
+    return res.status(401).json({
+      error: 'Invalid or expired auth token',
+    });
+  }
+}
+
+function buildProviderKey(provider, providerUserId) {
+  return `${provider}:${providerUserId}`;
+}
+
+function findOrCreateUser({
+  provider,
+  providerUserId,
+  email = null,
+  name = null,
+  avatarUrl = null,
+}) {
+  const providerKey = buildProviderKey(provider, providerUserId);
+  const existingUserId = usersByProviderKey.get(providerKey);
+
+  if (existingUserId) {
+    const existingUser = usersById.get(existingUserId);
+
+    if (existingUser) {
+      existingUser.email = email ?? existingUser.email;
+      existingUser.name = name ?? existingUser.name;
+      existingUser.avatarUrl = avatarUrl ?? existingUser.avatarUrl;
+      existingUser.updatedAt = new Date().toISOString();
+      return existingUser;
+    }
+  }
+
+  const newUser = {
+    id: `user_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`,
+    provider,
+    providerUserId,
+    email,
+    name,
+    avatarUrl,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+
+  usersById.set(newUser.id, newUser);
+  usersByProviderKey.set(providerKey, newUser.id);
+
+  return newUser;
+}
+
 app.get('/', (req, res) => {
   res.json({
     ok: true,
     message: 'Side Hustlers API is running',
   });
+});
+
+app.get('/me', authMiddleware, (req, res) => {
+  const user = usersById.get(req.user.sub);
+
+  if (!user) {
+    return res.status(404).json({
+      error: 'User not found',
+    });
+  }
+
+  res.json({
+    success: true,
+    user,
+  });
+});
+
+app.post('/auth/google', async (req, res) => {
+  try {
+    const { idToken } = req.body;
+
+    if (!idToken || typeof idToken !== 'string') {
+      return res.status(400).json({
+        error: 'Missing Google idToken',
+      });
+    }
+
+    const ticket = await googleClient.verifyIdToken({
+      idToken,
+    });
+
+    const payload = ticket.getPayload();
+
+    if (!payload || !payload.sub) {
+      return res.status(401).json({
+        error: 'Invalid Google token payload',
+      });
+    }
+
+    const user = findOrCreateUser({
+      provider: 'google',
+      providerUserId: payload.sub,
+      email: payload.email || null,
+      name: payload.name || null,
+      avatarUrl: payload.picture || null,
+    });
+
+    const token = createAppToken(user);
+
+    res.json({
+      success: true,
+      token,
+      user,
+    });
+  } catch (error) {
+    console.error('Google auth error:', error);
+
+    res.status(500).json({
+      error: 'Google authentication failed',
+      details: error?.message || 'Unknown server error',
+    });
+  }
 });
 
 function parseNumber(value) {
@@ -147,11 +309,14 @@ function fixPlatformFromSignals(parsed) {
   if (strongDoorDash && !strongInstacart && !strongUber) return 'DoorDash';
   if (strongUber && !strongInstacart && !strongDoorDash) return 'Uber Eats';
 
-  // tie-breakers
   if (strongDoorDash && strongInstacart) {
-    const hasGuaranteed = reasoningText.includes('guaranteed') || reasoningText.includes('incl. tips');
+    const hasGuaranteed =
+      reasoningText.includes('guaranteed') ||
+      reasoningText.includes('incl. tips');
     const hasDeliverBy = reasoningText.includes('deliver by');
-    const hasBatch = reasoningText.includes('batch') || reasoningText.includes('batch earnings');
+    const hasBatch =
+      reasoningText.includes('batch') ||
+      reasoningText.includes('batch earnings');
 
     if ((hasGuaranteed || hasDeliverBy) && !hasBatch) return 'DoorDash';
     if (hasBatch && !hasGuaranteed && !hasDeliverBy) return 'Instacart';
